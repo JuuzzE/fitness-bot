@@ -76,7 +76,7 @@ def get_bmi_interpretation(bmi):
     return " (🆘 Ожирение)"
 
 # --- Функция для запросов к Groq API (ask_groq - как раньше, но с ParseMode в ответе можно поэкспериментировать) ---
-async def ask_groq(user_message: str, model: str = "mixtral-8x7b-32768", system_prompt_override: str = None):
+async def ask_groq(user_message: str, model: str = "llama3-8b-8192", system_prompt_override: str = None):
     # ... (код ask_groq без изменений) ...
     # Возвращаемый текст от Groq может содержать Markdown, если его попросить об этом в системном промпте
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
