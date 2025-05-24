@@ -2,7 +2,7 @@ import logging
 import os
 import httpx
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
-from telegram.constants import ParseMode # Важно для Markdown
+from telegram.constants import ParseMode
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 
 if not GROQ_API_KEY or not TELEGRAM_TOKEN:
     logger.critical("КРИТИЧЕСКАЯ ОШИБКА: Не найдены API ключи! Установите GROQ_API_KEY и TELEGRAM_TOKEN.")
-    # exit(1)
+    # exit(1) # Можно раскомментировать, чтобы бот не стартовал без ключей
 
 # --- Системный промпт для AI ---
 SYSTEM_PROMPT_DIETITIAN = """
@@ -45,7 +45,7 @@ SYSTEM_PROMPT_DIETITIAN = """
 
 # --- Состояния для ConversationHandler ---
 (PROFILE_GENDER, PROFILE_AGE, PROFILE_HEIGHT, PROFILE_WEIGHT,
- PROFILE_ACTIVITY, PROFILE_GOAL) = range(6) # Убрал PROFILE_PROCESS, т.к. goal ведет к финалу
+ PROFILE_ACTIVITY, PROFILE_GOAL) = range(6)
 
 # --- Ключи для context.user_data ---
 GENDER, AGE, HEIGHT, CURRENT_WEIGHT, ACTIVITY_LEVEL, GOAL = \
@@ -54,20 +54,35 @@ PROFILE_COMPLETE = "profile_complete"
 BMI, BMR, TDEE, TARGET_CALORIES = "bmi", "bmr", "tdee", "target_calories"
 AWAITING_WEIGHT_UPDATE = "awaiting_weight_update"
 
-# --- Факторы для расчетов (как раньше) ---
+# --- Факторы для расчетов ---
 ACTIVITY_FACTORS = {"минимальная": 1.2, "легкая": 1.375, "средняя": 1.55, "высокая": 1.725, "экстремальная": 1.9}
 GOAL_FACTORS = {"похудеть": -500, "поддерживать вес": 0, "набрать массу": 300}
 
-# --- Вспомогательные функции для расчетов (как раньше) ---
-def calculate_bmi(w, h): return round(w / ((h / 100) ** 2), 1) if w and h else None
-def calculate_bmr(w, h, a, g):
-    if not all([w,h,a,g]): return None
-    g = g.lower()
-    if g=="мужской": return round((10*w)+(6.25*h)-(5*a)+5)
-    elif g=="женский": return round((10*w)+(6.25*h)-(5*a)-161)
+# --- Вспомогательные функции для расчетов ---
+def calculate_bmi(weight_kg, height_cm):
+    if not weight_kg or not height_cm or not isinstance(weight_kg, (int, float)) or not isinstance(height_cm, (int, float)) or height_cm == 0: return None
+    return round(weight_kg / ((height_cm / 100) ** 2), 1)
+
+def calculate_bmr(weight_kg, height_cm, age_years, gender_str):
+    if not all([weight_kg, height_cm, age_years, gender_str]) or \
+       not all(isinstance(i, (int, float)) for i in [weight_kg, height_cm, age_years]): return None
+    gender_str = gender_str.lower()
+    if gender_str == "мужской":
+        return round((10 * weight_kg) + (6.25 * height_cm) - (5 * age_years) + 5)
+    elif gender_str == "женский":
+        return round((10 * weight_kg) + (6.25 * height_cm) - (5 * age_years) - 161)
     return None
-def calculate_tdee(bmr, act): return round(bmr * ACTIVITY_FACTORS.get(act.lower())) if bmr and act else None
-def calculate_target_calories(tdee, gl): return tdee + GOAL_FACTORS.get(gl.lower()) if tdee and gl else None
+
+def calculate_tdee(bmr, activity_level_str):
+    if not bmr or not activity_level_str or not isinstance(bmr, (int, float)): return None
+    factor = ACTIVITY_FACTORS.get(activity_level_str.lower())
+    return round(bmr * factor) if factor else None
+
+def calculate_target_calories(tdee, goal_str):
+    if not tdee or not goal_str or not isinstance(tdee, (int,float)): return None
+    adjustment = GOAL_FACTORS.get(goal_str.lower())
+    return tdee + adjustment if adjustment is not None else None
+
 def get_bmi_interpretation(bmi):
     if bmi is None: return ""
     if bmi < 18.5: return " (📉 Дефицит массы тела)"
@@ -75,10 +90,8 @@ def get_bmi_interpretation(bmi):
     if bmi < 30: return " (⚠️ Избыточный вес)"
     return " (🆘 Ожирение)"
 
-# --- Функция для запросов к Groq API (ask_groq - как раньше, но с ParseMode в ответе можно поэкспериментировать) ---
+# --- Функция для запросов к Groq API ---
 async def ask_groq(user_message: str, model: str = "llama3-8b-8192", system_prompt_override: str = None):
-    # ... (код ask_groq без изменений) ...
-    # Возвращаемый текст от Groq может содержать Markdown, если его попросить об этом в системном промпте
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
     current_system_prompt = system_prompt_override if system_prompt_override else SYSTEM_PROMPT_DIETITIAN
     data = {"messages": [{"role": "system", "content": current_system_prompt}, {"role": "user", "content": user_message}], "model": model}
@@ -93,12 +106,19 @@ async def ask_groq(user_message: str, model: str = "llama3-8b-8192", system_prom
             return "🤖 Извини, у меня небольшие технические шоколадки с AI. Попробуй позже!"
     except httpx.HTTPStatusError as e:
         logger.error(f"Ошибка HTTP от Groq: {e.response.status_code} - {e.response.text}")
+        # Проверяем на специфичную ошибку decommissioned, хотя мы уже сменили модель
+        if "model_decommissioned" in e.response.text:
+             return f"🔌 Ой, похоже, выбранная модель AI ({model}) больше не доступна. Разработчик уже в курсе!"
         return f"🔌 Ошибка при обращении к AI (код: {e.response.status_code}). Пожалуйста, проверь свой API ключ Groq на Railway."
-    # ... (остальные except блоки) ...
+    except httpx.RequestError as e:
+        logger.error(f"Ошибка запроса к Groq: {e}")
+        return "📡 Проблема с подключением к AI. Возможно, временные неполадки."
+    except (KeyError, IndexError) as e:
+        logger.error(f"Ошибка парсинга ответа Groq: {e}")
+        return "🤯 Получен неожиданный или неполный ответ от AI. Попробуй еще раз."
     except Exception as e:
-        logger.error(f"Непредвиденная ошибка в ask_groq: {e}")
+        logger.error(f"Непредвиденная ошибка в ask_groq: {e}", exc_info=True)
         return "💥 Ой, что-то пошло совсем не так! Разработчик уже уведомлен (наверное)."
-
 
 # --- Функции для ConversationHandler (создание профиля) ---
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -111,10 +131,9 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         )
         return ConversationHandler.END
     
-    # Если профиль не завершен, начинаем или продолжаем онбординг
-    if not context.user_data.get(GENDER): # Проверяем самый первый шаг
-        context.user_data.clear() # Очищаем только если начинаем совсем с нуля
-        logger.info(f"Пользователь {user.id} ({user.username}) начинает создание профиля.")
+    if not context.user_data.get(GENDER):
+        context.user_data.clear()
+        logger.info(f"User {user.id} ({user.username}) начинает создание профиля.")
     
     await update.message.reply_text(
         f"🌟 Привет, {user.first_name}! Я *ФитГуру* – твой личный AI-диетолог и тренер.\n\n"
@@ -141,35 +160,37 @@ async def handle_gender_and_ask_age(update: Update, context: ContextTypes.DEFAUL
 async def handle_age_and_ask_height(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     try:
         age = int(update.message.text)
-        if not 10 <= age <= 100: raise ValueError()
+        if not 10 <= age <= 100: raise ValueError("Возраст вне допустимого диапазона")
         context.user_data[AGE] = age
         await update.message.reply_text(
             text=f"Возраст: *{age} лет*. Замечательно! ✅\n\n📏 Теперь введи свой *рост* (в сантиметрах):",
             parse_mode=ParseMode.MARKDOWN
         )
         return PROFILE_HEIGHT
-    except ValueError:
-        await update.message.reply_text("🤔 Хм, возраст должен быть числом (например, 25). Попробуй еще раз!")
+    except ValueError as e:
+        logger.warning(f"User {update.effective_user.id} ввел некорректный возраст: {update.message.text}. Ошибка: {e}")
+        await update.message.reply_text("🤔 Хм, возраст должен быть целым числом от 10 до 100 (например, 25). Попробуй еще раз!")
         return PROFILE_AGE
 
 async def handle_height_and_ask_weight(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     try:
         height = int(update.message.text)
-        if not 100 <= height <= 250: raise ValueError()
+        if not 100 <= height <= 250: raise ValueError("Рост вне допустимого диапазона")
         context.user_data[HEIGHT] = height
         await update.message.reply_text(
             text=f"Рост: *{height} см*. Записал! 📝\n\n⚖️ Теперь введи свой текущий *вес* (в кг, например, 70.5):",
             parse_mode=ParseMode.MARKDOWN
         )
         return PROFILE_WEIGHT
-    except ValueError:
-        await update.message.reply_text("🤔 Рост должен быть числом в сантиметрах (например, 175). Попробуй снова!")
+    except ValueError as e:
+        logger.warning(f"User {update.effective_user.id} ввел некорректный рост: {update.message.text}. Ошибка: {e}")
+        await update.message.reply_text("🤔 Рост должен быть целым числом в сантиметрах от 100 до 250 (например, 175). Попробуй снова!")
         return PROFILE_HEIGHT
 
 async def handle_weight_and_ask_activity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     try:
         weight = float(update.message.text.replace(',', '.'))
-        if not 30 <= weight <= 300: raise ValueError()
+        if not 30 <= weight <= 300: raise ValueError("Вес вне допустимого диапазона")
         context.user_data[CURRENT_WEIGHT] = weight
         activity_buttons = [
             [InlineKeyboardButton("🧘‍♀️ Минимальная (сидячая работа)", callback_data="минимальная")],
@@ -184,8 +205,9 @@ async def handle_weight_and_ask_activity(update: Update, context: ContextTypes.D
             parse_mode=ParseMode.MARKDOWN
         )
         return PROFILE_ACTIVITY
-    except ValueError:
-        await update.message.reply_text("🤔 Вес должен быть числом (например, 70.5). Давай еще разок!")
+    except ValueError as e:
+        logger.warning(f"User {update.effective_user.id} ввел некорректный вес: {update.message.text}. Ошибка: {e}")
+        await update.message.reply_text("🤔 Вес должен быть числом от 30 до 300 (например, 70.5). Давай еще разок!")
         return PROFILE_WEIGHT
 
 async def handle_activity_and_ask_goal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -205,40 +227,66 @@ async def handle_activity_and_ask_goal(update: Update, context: ContextTypes.DEF
 
 async def process_final_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
+    user_id = update.effective_user.id
+    logger.info(f"User {user_id}: Entered process_final_profile with callback_data: {query.data}")
+
     await query.answer()
     context.user_data[GOAL] = query.data
     ud = context.user_data
 
-    ud[BMI] = calculate_bmi(ud.get(CURRENT_WEIGHT), ud.get(HEIGHT))
-    ud[BMR] = calculate_bmr(ud.get(CURRENT_WEIGHT), ud.get(HEIGHT), ud.get(AGE), ud.get(GENDER))
-    ud[TDEE] = calculate_tdee(ud.get(BMR), ud.get(ACTIVITY_LEVEL))
-    ud[TARGET_CALORIES] = calculate_target_calories(ud.get(TDEE), ud.get(GOAL))
-    ud[PROFILE_COMPLETE] = True
-    ud.pop(AWAITING_WEIGHT_UPDATE, None)
+    logger.info(f"User {user_id}: Goal '{ud.get(GOAL)}' saved. User data before calcs: {ud}")
 
-    bmi_interp = get_bmi_interpretation(ud.get(BMI))
-    summary = (
-        f"🎉 *Поздравляю!* Твой профиль полностью готов. Вот твои ключевые показатели:\n\n"
-        f"👤 *Твой профиль:*\n"
-        f"  - Пол: _{ud.get(GENDER, 'N/A').capitalize()}_\n"
-        f"  - Возраст: _{ud.get(AGE, 'N/A')} лет_\n"
-        f"  - Рост: _{ud.get(HEIGHT, 'N/A')} см_\n"
-        f"  - Вес: _{ud.get(CURRENT_WEIGHT, 'N/A')} кг_\n"
-        f"  - Активность: _{ud.get(ACTIVITY_LEVEL, 'N/A').capitalize()}_\n"
-        f"  - Цель: _{ud.get(GOAL, 'N/A').capitalize()}_\n\n"
-        f"📊 *Расчетные показатели:*\n"
-        f"  - ИМТ: *{ud.get(BMI, 'N/A')}*{bmi_interp}\n"
-        f"  - BMR (базальный метаболизм): *{ud.get(BMR, 'N/A')} ккал/день*\n"
-        f"  - TDEE (суточная потребность): *{ud.get(TDEE, 'N/A')} ккал/день*\n"
-        f"  - ✨ *Рекомендуемые калории для цели: *`{ud.get(TARGET_CALORIES, 'N/A')} ккал/день`* ✨\n\n"
-        "Теперь я готов помогать тебе на пути к цели! Используй /menu для быстрого доступа к функциям.\n\n"
-        "⚠️ *Помни, эти расчеты носят рекомендательный характер. Для точных медицинских советов проконсультируйся с врачом.*"
-    )
-    await query.edit_message_text(text=summary, parse_mode=ParseMode.MARKDOWN)
-    logger.info(f"Пользователь {update.effective_user.id} завершил профиль.")
-    return ConversationHandler.END
+    try:
+        ud[BMI] = calculate_bmi(ud.get(CURRENT_WEIGHT), ud.get(HEIGHT))
+        ud[BMR] = calculate_bmr(ud.get(CURRENT_WEIGHT), ud.get(HEIGHT), ud.get(AGE), ud.get(GENDER))
+        ud[TDEE] = calculate_tdee(ud.get(BMR), ud.get(ACTIVITY_LEVEL))
+        ud[TARGET_CALORIES] = calculate_target_calories(ud.get(TDEE), ud.get(GOAL))
+        
+        logger.info(f"User {user_id}: Calculations complete. BMI: {ud.get(BMI)}, BMR: {ud.get(BMR)}, TDEE: {ud.get(TDEE)}, TARGET_CALORIES: {ud.get(TARGET_CALORIES)}")
+
+        if None in [ud.get(BMI), ud.get(BMR), ud.get(TDEE), ud.get(TARGET_CALORIES)]:
+            logger.error(f"User {user_id}: One or more calculated values are None. Cannot complete profile.")
+            await query.edit_message_text("Ой, произошла ошибка при расчете твоих данных. Некоторые значения не удалось вычислить. 😥 Пожалуйста, попробуй начать заново с /start.")
+            context.user_data.pop(PROFILE_COMPLETE, None)
+            return ConversationHandler.END
+
+        ud[PROFILE_COMPLETE] = True
+        logger.info(f"User {user_id}: PROFILE_COMPLETE set to True.")
+        
+        ud.pop(AWAITING_WEIGHT_UPDATE, None)
+
+        bmi_interp = get_bmi_interpretation(ud.get(BMI))
+        summary = (
+            f"🎉 *Поздравляю!* Твой профиль полностью готов. Вот твои ключевые показатели:\n\n"
+            f"👤 *Твой профиль:*\n"
+            f"  - Пол: _{ud.get(GENDER, 'N/A').capitalize()}_\n"
+            f"  - Возраст: _{ud.get(AGE, 'N/A')} лет_\n"
+            f"  - Рост: _{ud.get(HEIGHT, 'N/A')} см_\n"
+            f"  - Вес: _{ud.get(CURRENT_WEIGHT, 'N/A')} кг_\n"
+            f"  - Активность: _{ud.get(ACTIVITY_LEVEL, 'N/A').capitalize()}_\n"
+            f"  - Цель: _{ud.get(GOAL, 'N/A').capitalize()}_\n\n"
+            f"📊 *Расчетные показатели:*\n"
+            f"  - ИМТ: *{ud.get(BMI, 'N/A')}*{bmi_interp}\n"
+            f"  - BMR (базальный метаболизм): *{ud.get(BMR, 'N/A')} ккал/день*\n"
+            f"  - TDEE (суточная потребность): *{ud.get(TDEE, 'N/A')} ккал/день*\n"
+            f"  - ✨ *Рекомендуемые калории для цели: *`{ud.get(TARGET_CALORIES, 'N/A')} ккал/день`* ✨\n\n"
+            "Теперь я готов помогать тебе на пути к цели! Используй /menu для быстрого доступа к функциям.\n\n"
+            "⚠️ *Помни, эти расчеты носят рекомендательный характер. Для точных медицинских советов проконсультируйся с врачом.*"
+        )
+        await query.edit_message_text(text=summary, parse_mode=ParseMode.MARKDOWN)
+        logger.info(f"User {user_id}: Profile summary sent. Exiting ConversationHandler.")
+        return ConversationHandler.END
+
+    except Exception as e:
+        logger.error(f"User {user_id}: ERROR in process_final_profile: {e}", exc_info=True)
+        await query.edit_message_text(
+            "Ой, что-то пошло не так при расчете твоего профиля. 😥 Попробуй начать заново с /start."
+        )
+        context.user_data.pop(PROFILE_COMPLETE, None)
+        return ConversationHandler.END
 
 async def cancel_onboarding(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    # ... (код cancel_onboarding как в предыдущей "стильной" версии) ...
     user_id = update.effective_user.id
     if not context.user_data.get(PROFILE_COMPLETE):
         logger.info(f"Пользователь {user_id} отменил создание профиля.")
@@ -249,22 +297,20 @@ async def cancel_onboarding(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     context.user_data.pop(AWAITING_WEIGHT_UPDATE, None)
     return ConversationHandler.END
 
-# --- Обычные команды ---
+
+# --- Обычные команды (menu_command, help_command, my_profile_command, weight_command_entry, train_command - как в "стильной" версии) ---
 async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Отправляет сообщение с главным меню (можно использовать ReplyKeyboardMarkup)."""
     if not context.user_data.get(PROFILE_COMPLETE):
         await update.message.reply_text("Сначала давай создадим твой профиль! Нажми /start 😊", parse_mode=ParseMode.MARKDOWN)
         return
-
     menu_buttons = [
         [KeyboardButton("🏋️‍♂️ Тренировка (/train)"), KeyboardButton("⚖️ Обновить вес (/weight)")],
         [KeyboardButton("📊 Мой профиль (/myprofile)"), KeyboardButton("❓ Помощь (/help)")],
     ]
     await update.message.reply_text(
         "👇 Вот что мы можем сделать:",
-        reply_markup=ReplyKeyboardMarkup(menu_buttons, resize_keyboard=True, one_time_keyboard=False) # False, чтобы клавиатура не исчезала сразу
+        reply_markup=ReplyKeyboardMarkup(menu_buttons, resize_keyboard=True, one_time_keyboard=False)
     )
-
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = (
@@ -285,7 +331,6 @@ async def my_profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not context.user_data.get(PROFILE_COMPLETE):
         await update.message.reply_text("Твой профиль еще не создан. Пожалуйста, начни с /start 🌟")
         return
-
     ud = context.user_data
     bmi_interp = get_bmi_interpretation(ud.get(BMI))
     summary = (
@@ -309,22 +354,20 @@ async def weight_command_entry(update: Update, context: ContextTypes.DEFAULT_TYP
     if not context.user_data.get(PROFILE_COMPLETE):
         await update.message.reply_text("Сначала давай создадим твой профиль! Нажми /start 😊")
         return
-    
     await update.message.reply_text("⚖️ Введи свой *текущий вес* (например, 70.5):", parse_mode=ParseMode.MARKDOWN)
     context.user_data[AWAITING_WEIGHT_UPDATE] = True
 
 async def handle_weight_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # ... (код handle_weight_update как в "стильной" версии, с ParseMode.MARKDOWN) ...
     try:
         new_weight = float(update.message.text.replace(',', '.'))
         if not 30 <= new_weight <= 300: raise ValueError("Некорректный вес")
-
         ud = context.user_data
         ud[CURRENT_WEIGHT] = new_weight
         ud[BMI] = calculate_bmi(new_weight, ud.get(HEIGHT))
         ud[BMR] = calculate_bmr(new_weight, ud.get(HEIGHT), ud.get(AGE), ud.get(GENDER))
         ud[TDEE] = calculate_tdee(ud.get(BMR), ud.get(ACTIVITY_LEVEL))
         ud[TARGET_CALORIES] = calculate_target_calories(ud.get(TDEE), ud.get(GOAL))
-        
         ud.pop(AWAITING_WEIGHT_UPDATE, None)
         bmi_interp = get_bmi_interpretation(ud.get(BMI))
         await update.message.reply_text(
@@ -337,15 +380,16 @@ async def handle_weight_update(update: Update, context: ContextTypes.DEFAULT_TYP
     except ValueError:
         await update.message.reply_text("🤔 Вес должен быть числом (например, 70.5). Попробуй еще раз /weight или введи вес снова.")
     except Exception as e:
-        logger.error(f"Ошибка в handle_weight_update: {e}")
+        logger.error(f"Ошибка в handle_weight_update: {e}", exc_info=True)
         await update.message.reply_text("💥 Ой, произошла ошибка при обновлении веса.")
         context.user_data.pop(AWAITING_WEIGHT_UPDATE, None)
 
+
 async def train_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # ... (код train_command как в "стильной" версии, с ParseMode.MARKDOWN) ...
     if not context.user_data.get(PROFILE_COMPLETE):
         await update.message.reply_text("Чтобы подобрать тренировку, мне нужен твой профиль. Начни с /start 🌟")
         return
-
     ud = context.user_data
     profile_info = (f"Профиль: П:{ud.get(GENDER,'N/A')}, В:{ud.get(AGE,'N/A')}, "
                     f"Р:{ud.get(HEIGHT,'N/A')}см, Вес:{ud.get(CURRENT_WEIGHT,'N/A')}кг, "
@@ -353,13 +397,29 @@ async def train_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"ИМТ:{ud.get(BMI,'N/A')}, Калории:{ud.get(TARGET_CALORIES,'N/A')}.")
     prompt = (f"{profile_info} Создай домашнюю тренировку (20-30 мин) без оборудования, учитывая профиль. "
               "Укажи подходы, повторения, советы. Используй Markdown для оформления, например, списки упражнений.")
-    
     await update.message.reply_text("🏋️‍♂️ Подбираю для тебя *персонализированную тренировку*... Пожалуйста, подожди!", parse_mode=ParseMode.MARKDOWN)
     reply = await ask_groq(prompt)
-    await update.message.reply_text(reply, parse_mode=ParseMode.MARKDOWN) # Просим AI тоже использовать Markdown
+    await update.message.reply_text(reply, parse_mode=ParseMode.MARKDOWN)
+
 
 # --- Обработчик общих сообщений ---
 async def general_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # ... (код general_message_handler как в "стильной" версии, с ParseMode.MARKDOWN) ...
+    # Добавляем обработку текстовых кнопок из /menu, если они не команды
+    user_message = update.message.text
+    if user_message == "🏋️‍♂️ Тренировка (/train)": # Обработка текста кнопки
+        await train_command(update, context)
+        return
+    if user_message == "⚖️ Обновить вес (/weight)":
+        await weight_command_entry(update, context)
+        return
+    if user_message == "📊 Мой профиль (/myprofile)":
+        await my_profile_command(update, context)
+        return
+    if user_message == "❓ Помощь (/help)":
+        await help_command(update, context)
+        return
+        
     if context.user_data.get(AWAITING_WEIGHT_UPDATE) is True:
         await handle_weight_update(update, context)
         return
@@ -370,10 +430,9 @@ async def general_message_handler(update: Update, context: ContextTypes.DEFAULT_
             "Начни с команды /start, чтобы я мог тебе эффективно помогать! 😊"
         )
         return
-
-    user_message = update.message.text
-    logger.info(f"Сообщение от {update.effective_user.id} ({update.effective_user.username}): {user_message}")
     
+    # Если это не кнопка меню и не ожидание веса, то это общий вопрос к AI
+    logger.info(f"Сообщение от {update.effective_user.id} ({update.effective_user.username}): {user_message}")
     ud = context.user_data
     profile_info = (f"Контекст (для напоминания AI): П:{ud.get(GENDER,'N/A')}, В:{ud.get(AGE,'N/A')}, "
                     f"Р:{ud.get(HEIGHT,'N/A')}см, Вес:{ud.get(CURRENT_WEIGHT,'N/A')}кг, "
@@ -382,16 +441,18 @@ async def general_message_handler(update: Update, context: ContextTypes.DEFAULT_
                     f"Целевые калории:{ud.get(TARGET_CALORIES,'N/A')}. "
                     "Ответь на вопрос пользователя, учитывая это: ")
     full_prompt = f"{profile_info}{user_message}"
-
     await update.message.reply_text("🤔 *Обрабатываю твой запрос...*", parse_mode=ParseMode.MARKDOWN)
     reply = await ask_groq(full_prompt)
     await update.message.reply_text(reply, parse_mode=ParseMode.MARKDOWN)
 
+
 # --- Основная функция ---
 def main():
-    if not TELEGRAM_TOKEN: return
-    if not GROQ_API_KEY:
-        logger.warning("GROQ_API_KEY не установлен. AI-функции могут не работать.")
+    if not TELEGRAM_TOKEN:
+        logger.critical("TELEGRAM_TOKEN не найден! Бот не может запуститься.")
+        return
+    if not GROQ_API_KEY: # Предупреждение, если GROQ ключ отсутствует, но бот может запуститься для не-AI функций
+        logger.warning("GROQ_API_KEY не установлен. AI-функции (тренировки, общие вопросы) не будут работать.")
 
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
@@ -405,10 +466,10 @@ def main():
             PROFILE_ACTIVITY: [CallbackQueryHandler(handle_activity_and_ask_goal, pattern="^(минимальная|легкая|средняя|высокая|экстремальная)$")],
             PROFILE_GOAL: [CallbackQueryHandler(process_final_profile, pattern="^(похудеть|поддерживать вес|набрать массу)$")],
         },
-        fallbacks=[CommandHandler("cancel", cancel_onboarding), CommandHandler("start", start_command)], # Позволяем /start перезапускать/выходить
+        fallbacks=[CommandHandler("cancel", cancel_onboarding), CommandHandler("start", start_command)],
         allow_reentry=True, 
         per_user=True,
-        per_chat=True,
+        per_chat=True, # Важно, чтобы ConversationHandler работал корректно в личных чатах
     )
     app.add_handler(onboarding_conv_handler)
 
@@ -417,11 +478,10 @@ def main():
     app.add_handler(CommandHandler("myprofile", my_profile_command))
     app.add_handler(CommandHandler("weight", weight_command_entry))
     app.add_handler(CommandHandler("train", train_command))
-    # /start уже точка входа для ConversationHandler
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, general_message_handler))
 
-    logger.info("🤖 Бот ФитГуру v2.0 (стильный) запускается...")
+    logger.info("🤖 Бот ФитГуру v2.1 (с логами и стилем) запускается...")
     app.run_polling()
 
 if __name__ == "__main__":
