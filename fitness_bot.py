@@ -70,8 +70,8 @@ def get_bmi_interpretation(bmi):
     if bmi < 30: return " (⚠️ Избыточный вес)"
     return " (🆘 Ожирение)"
 
-# --- Функция для запросов к Groq API (возвращаем llama3-8b, уменьшаем таймаут) ---
-async def ask_groq(user_message: str, model: str = "llama3-8b-8192", system_prompt_override: str = None, temperature: float = 0.5): # МОДЕЛЬ ИЗМЕНЕНА
+# --- Функция для запросов к Groq API (МОДЕЛЬ ВОЗВРАЩЕНА НА GEMMA) ---
+async def ask_groq(user_message: str, model: str = "gemma2-9b-it", system_prompt_override: str = None, temperature: float = 0.5): # МОДЕЛЬ ИЗМЕНЕНА
     if not GROQ_API_KEY:
         logger.warning("GROQ_API_KEY не установлен. AI запрос не будет выполнен.")
         return "К сожалению, я сейчас не могу связаться со своим AI-мозгом. Попробуйте позже или проверьте настройки API ключа."
@@ -90,7 +90,7 @@ async def ask_groq(user_message: str, model: str = "llama3-8b-8192", system_prom
                 "https://api.groq.com/openai/v1/chat/completions", 
                 headers=headers, 
                 json=data, 
-                timeout=30.0 # УМЕНЬШЕН ТАЙМАУТ до 30 секунд
+                timeout=30.0 # Таймаут 30 секунд
             )
             response.raise_for_status()
             response_data = response.json()
@@ -124,10 +124,10 @@ async def ask_groq(user_message: str, model: str = "llama3-8b-8192", system_prom
         return "💥 Ой, что-то пошло совсем не так с AI! Разработчик уже в курсе."
 
 
-# --- Функции для ConversationHandler (создание профиля - как в v2.4) ---
-# (Код функций start_command ... process_final_profile, cancel_onboarding оставлен без изменений из предыдущей версии)
-# ... (Вставь сюда полный код этих функций из предыдущего ответа v2.4) ...
-# --- Копипаста функций онбординга из v2.4 ---
+# --- Функции для ConversationHandler (создание профиля - как в v2.5) ---
+# (Код функций start_command ... process_final_profile, cancel_onboarding оставлен без изменений из предыдущей версии v2.5)
+# ... (Вставь сюда полный код этих функций из версии v2.5, где ты подтвердил, что он рабочий) ...
+# --- Копипаста функций онбординга из v2.5 ---
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user = update.effective_user
     if context.user_data.get(PROFILE_COMPLETE):
@@ -258,8 +258,8 @@ async def cancel_onboarding(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     return ConversationHandler.END
 # --- Конец копипасты функций онбординга ---
 
-# --- Обычные команды (menu_command, help_command, my_profile_command, weight_command_entry - как в v2.4) ---
-# ... (Вставь сюда полный код этих функций из предыдущего ответа v2.4) ...
+# --- Обычные команды (как в v2.5) ---
+# ... (Вставь сюда полный код этих функций из предыдущего ответа v2.5) ...
 # --- Копипаста обычных команд ---
 async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.user_data.get(PROFILE_COMPLETE):
@@ -324,9 +324,9 @@ async def handle_weight_update(update: Update, context: ContextTypes.DEFAULT_TYP
         context.user_data.pop(AWAITING_WEIGHT_UPDATE, None)
 # --- Конец копипасты обычных команд ---
 
-
-# --- Улучшенная команда /train ---
-async def train_command_entry(update: Update, context: ContextTypes.DEFAULT_TYPE): # Как в v2.4
+# --- Улучшенная команда /train (как в v2.5) ---
+async def train_command_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # ... (код train_command_entry как в v2.5) ...
     if not context.user_data.get(PROFILE_COMPLETE):
         await update.message.reply_text("Чтобы подобрать тренировку, мне нужен твой профиль. Начни с /start 🌟", parse_mode=ParseMode.MARKDOWN)
         return
@@ -335,26 +335,24 @@ async def train_command_entry(update: Update, context: ContextTypes.DEFAULT_TYPE
     message_to_reply = update.message if update.message else update.callback_query.message
     await message_to_reply.reply_text("Отлично! Где ты планируешь заниматься?", reply_markup=reply_markup)
 
+
 async def handle_train_location_and_generate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # ... (код handle_train_location_and_generate как в v2.5, с логами и проверкой ответа AI) ...
     query = update.callback_query
     await query.answer()
-    
-    user_id = update.effective_user.id # Для логов
+    user_id = update.effective_user.id 
     logger.info(f"User {user_id}: Запрос тренировки, выбор: {query.data}")
-
     location_choice = query.data
     location_text, equipment_text = "", ""
     if location_choice == "train_home": location_text, equipment_text = "для дома", "без специального оборудования"
     elif location_choice == "train_gym": location_text, equipment_text = "для тренажерного зала", "с использованием стандартного оборудования зала"
     elif location_choice == "train_street": location_text, equipment_text = "для улицы", "с минимальным оборудованием или без него"
-    
     ud = context.user_data
     profile_info = (f"ВАЖНО: Это данные профиля пользователя, используй их: Пол:{ud.get(GENDER,'N/A')}, Возраст:{ud.get(AGE,'N/A')}, "
                     f"Рост:{ud.get(HEIGHT,'N/A')}см, Вес:{ud.get(CURRENT_WEIGHT,'N/A')}кг, "
                     f"Активность:{ud.get(ACTIVITY_LEVEL,'N/A')}, Цель:{ud.get(GOAL,'N/A')}. "
                     f"ИМТ:{ud.get(BMI,'N/A')}, Рекомендуемые калории для цели:{ud.get(TARGET_CALORIES,'N/A')}. "
                     "Не запрашивай эти данные у пользователя снова, они уже предоставлены.")
-
     prompt = (
         f"{profile_info} Пользователь хочет тренировку {location_text}, {equipment_text}. "
         "Твоя задача - сгенерировать программу тренировок. Ответ должен быть полностью на русском языке, очень грамотным и естественным, без выдуманных слов или странных фраз. "
@@ -369,25 +367,18 @@ async def handle_train_location_and_generate(update: Update, context: ContextTyp
         "В самом конце, отдельным абзацем, четко укажи: '🔥 Примерно сожжено калорий за эту тренировку: X-Y ккал.'. Замени X-Y на реалистичную оценку, учитывая вес пользователя и интенсивность. "
         "Стиль — дружелюбный и мотивирующий тренер. Ответ должен быть хорошо структурирован с использованием Markdown (списки -, жирный шрифт * для акцентов)."
     )
-    
     await query.edit_message_text("🏋️‍♂️ Подбираю для тебя *персонализированную тренировку*... Это может занять до 30 секунд.", parse_mode=ParseMode.MARKDOWN)
     logger.info(f"User {user_id}: Отправка промпта для тренировки в AI...")
-    
-    reply = await ask_groq(prompt, temperature=0.45) # Снижена температура для большей строгости
-    
-    if reply and ("Ошибка" in reply or "Упс" in reply or "Извини" in reply or "К сожалению" in reply): # Проверка на сообщения об ошибках от ask_groq
-        logger.warning(f"User {user_id}: AI вернул сообщение, похожее на ошибку: {reply}")
-        # Отправляем как есть, так как ask_groq уже вернул текст ошибки
+    reply = await ask_groq(prompt, temperature=0.45)
+    if reply and not any(err_word in reply for err_word in ["Ошибка", "Упс", "Извини", "К сожалению", "не могу", "не удалось"]):
+        logger.info(f"User {user_id}: Получен валидный ответ от AI для тренировки.")
         await query.message.reply_text(reply, parse_mode=ParseMode.MARKDOWN)
-    elif reply:
-        logger.info(f"User {user_id}: Получен ответ от AI для тренировки.")
-        await query.message.reply_text(reply, parse_mode=ParseMode.MARKDOWN)
-    else: # Если reply None или пустой (хотя ask_groq должен вернуть строку ошибки)
-        logger.error(f"User {user_id}: Получен пустой ответ от AI для тренировки.")
-        await query.message.reply_text("Не удалось сгенерировать тренировку. Попробуйте позже.", parse_mode=ParseMode.MARKDOWN)
+    else:
+        logger.warning(f"User {user_id}: AI вернул сообщение, похожее на ошибку, или пустой ответ: {reply}")
+        await query.message.reply_text(reply if reply else "Не удалось сгенерировать тренировку. Попробуйте позже.", parse_mode=ParseMode.MARKDOWN)
 
 
-# --- Обработчик общих сообщений (как в v2.4) ---
+# --- Обработчик общих сообщений (как в v2.5) ---
 async def general_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_message = update.message.text
     if user_message == "🏋️‍♂️ Тренировка (/train)": await train_command_entry(update, context); return
@@ -406,7 +397,7 @@ def main():
 
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
-    onboarding_conv_handler = ConversationHandler( # Как в v2.4
+    onboarding_conv_handler = ConversationHandler( # Как в v2.5
         entry_points=[CommandHandler("start", start_command)],
         states={
             PROFILE_GENDER: [CallbackQueryHandler(handle_gender_and_ask_age, pattern="^(мужской|женский)$")],
@@ -429,7 +420,7 @@ def main():
     app.add_handler(CommandHandler("weight", weight_command_entry))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, general_message_handler))
 
-    logger.info("🤖 Бот ФитГуру v2.5 (Llama3-8B, таймаут 30s, логи) запускается...")
+    logger.info("🤖 Бот ФитГуру v2.6 (Gemma, таймаут 30s, улучшенные промпты) запускается...")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
