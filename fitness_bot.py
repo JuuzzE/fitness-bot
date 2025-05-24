@@ -5,10 +5,7 @@ from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, Con
 
 # Вставь сюда свои ключи
 GROQ_API_KEY = "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"
-import os
-TOKEN = os.getenv("7561034666:AAEEWXkLlHkualECQ8Bmmkn2BNtlHa5Vrg4")
-
-
+TELEGRAM_TOKEN = "7561034666:AAEEWXkLlHkualECQ8Bmmkn2BNtlHa5Vrg4"
 logging.basicConfig(level=logging.INFO)
 
 def ask_groq(message):
