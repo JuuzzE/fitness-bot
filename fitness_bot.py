@@ -1,6 +1,9 @@
 import logging
 import os
 import httpx
+import json # <--- ДОБАВЛЕН ИМПОРТ
+from datetime import datetime, date # <--- ДОБАВЛЕН ИМПОРТ для отслеживания дня
+
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -23,7 +26,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 if not GROQ_API_KEY:
-    logger.warning("GROQ_API_KEY не установлен. AI-функции (тренировки, общие вопросы) не будут работать.")
+    logger.warning("GROQ_API_KEY не установлен. AI-функции не будут работать.")
 if not TELEGRAM_TOKEN:
     logger.critical("TELEGRAM_TOKEN не найден! Бот не может запуститься.")
     # exit(1)
@@ -40,16 +43,28 @@ SYSTEM_PROMPT_DIETITIAN = """
 Используй сохраненный профиль для персонализации всех последующих советов, планов тренировок и ответов на вопросы.
 Если пользователь просит что-то, что выходит за рамки твоей компетенции как диетолога/тренера (например, медицинский диагноз), вежливо откажи и порекомендуй обратиться к специалисту.
 При генерации тренировок, четко указывай название упражнения, количество подходов, количество повторений, время отдыха. Оценивай примерное количество сожженных калорий за тренировку.
+Когда просят оценить КБЖУ съеденной пищи, СТРОГО придерживайся формата JSON, который указан в пользовательском промпте. Не добавляй никакого текста до или после JSON.
 """
 
-# --- Состояния и Ключи (как раньше) ---
+# --- Состояния для ConversationHandler ---
 (PROFILE_GENDER, PROFILE_AGE, PROFILE_HEIGHT, PROFILE_WEIGHT,
  PROFILE_ACTIVITY, PROFILE_GOAL) = range(6)
+
+# Новые состояния для записи приемов пищи
+(ADDMEAL_CHOOSE_TYPE, ADDMEAL_GET_DESCRIPTION) = range(PROFILE_GOAL + 1, PROFILE_GOAL + 3)
+
+
+# --- Ключи для context.user_data ---
 GENDER, AGE, HEIGHT, CURRENT_WEIGHT, ACTIVITY_LEVEL, GOAL = \
     "gender", "age", "height", "current_weight", "activity_level", "goal"
 PROFILE_COMPLETE = "profile_complete"
 BMI, BMR, TDEE, TARGET_CALORIES = "bmi", "bmr", "tdee", "target_calories"
 AWAITING_WEIGHT_UPDATE = "awaiting_weight_update"
+
+TODAY_MEALS = "today_meals" # Список словарей для приемов пищи
+LAST_MEAL_DATE = "last_meal_date" # Для отслеживания смены дня
+
+# --- Факторы для расчетов (как раньше) ---
 ACTIVITY_FACTORS = {"минимальная": 1.2, "легкая": 1.375, "средняя": 1.55, "высокая": 1.725, "экстремальная": 1.9}
 GOAL_FACTORS = {"похудеть": -500, "поддерживать вес": 0, "набрать массу": 300}
 
@@ -70,42 +85,29 @@ def get_bmi_interpretation(bmi):
     if bmi < 30: return " (⚠️ Избыточный вес)"
     return " (🆘 Ожирение)"
 
-# --- Функция для запросов к Groq API (МОДЕЛЬ ВОЗВРАЩЕНА НА GEMMA) ---
-async def ask_groq(user_message: str, model: str = "gemma2-9b-it", system_prompt_override: str = None, temperature: float = 0.5): # МОДЕЛЬ ИЗМЕНЕНА
+# --- Функция для запросов к Groq API (как в v2.6) ---
+async def ask_groq(user_message: str, model: str = "gemma2-9b-it", system_prompt_override: str = None, temperature: float = 0.5):
+    # ... (полный код ask_groq из версии 2.6) ...
     if not GROQ_API_KEY:
         logger.warning("GROQ_API_KEY не установлен. AI запрос не будет выполнен.")
         return "К сожалению, я сейчас не могу связаться со своим AI-мозгом. Попробуйте позже или проверьте настройки API ключа."
-
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
     current_system_prompt = system_prompt_override if system_prompt_override else SYSTEM_PROMPT_DIETITIAN
-    data = {
-        "messages": [{"role": "system", "content": current_system_prompt}, {"role": "user", "content": user_message}],
-        "model": model,
-        "temperature": temperature
-    }
+    data = {"messages": [{"role": "system", "content": current_system_prompt}, {"role": "user", "content": user_message}], "model": model, "temperature": temperature}
     logger.info(f"Отправка запроса к Groq. Модель: {model}, Температура: {temperature}. Сообщение: {user_message[:100]}...")
     try:
         async with httpx.AsyncClient() as client:
-            response = await client.post(
-                "https://api.groq.com/openai/v1/chat/completions", 
-                headers=headers, 
-                json=data, 
-                timeout=30.0 # Таймаут 30 секунд
-            )
+            response = await client.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=data, timeout=30.0)
             response.raise_for_status()
             response_data = response.json()
-
             if response_data.get("choices") and response_data["choices"][0].get("message"):
                 logger.info(f"Успешный ответ от Groq ({model}).")
                 return response_data["choices"][0]["message"]["content"]
-            else:
-                logger.error(f"Неожиданная структура ответа от Groq ({model}): {response_data}")
-                return "🤖 Извини, у меня небольшие технические шоколадки с AI. Структура ответа некорректна."
-
+            logger.error(f"Неожиданная структура ответа от Groq ({model}): {response_data}")
+            return "🤖 Извини, у меня небольшие технические шоколадки с AI. Структура ответа некорректна."
     except httpx.HTTPStatusError as e:
         logger.error(f"Ошибка HTTP от Groq ({model}): {e.response.status_code} - {e.response.text}")
-        if "model_decommissioned" in e.response.text:
-             return f"🔌 Ой, похоже, выбранная модель AI ({model}) больше не доступна. Разработчик уже в курсе!"
+        if "model_decommissioned" in e.response.text: return f"🔌 Ой, похоже, выбранная модель AI ({model}) больше не доступна. Разработчик уже в курсе!"
         return f"🔌 Ошибка при обращении к AI (код: {e.response.status_code}). Пожалуйста, проверь свой API ключ Groq."
     except httpx.ReadTimeout:
         logger.error(f"Таймаут чтения ответа от Groq API ({model}). Модель слишком долго генерировала ответ.")
@@ -123,25 +125,38 @@ async def ask_groq(user_message: str, model: str = "gemma2-9b-it", system_prompt
         logger.error(f"Непредвиденная ошибка в ask_groq ({model}): {e}", exc_info=True)
         return "💥 Ой, что-то пошло совсем не так с AI! Разработчик уже в курсе."
 
-
-# --- Функции для ConversationHandler (создание профиля - как в v2.5) ---
-# (Код функций start_command ... process_final_profile, cancel_onboarding оставлен без изменений из предыдущей версии v2.5)
-# ... (Вставь сюда полный код этих функций из версии v2.5, где ты подтвердил, что он рабочий) ...
-# --- Копипаста функций онбординга из v2.5 ---
+# --- Функции для ConversationHandler (создание профиля - как в v2.6) ---
+# (Код функций start_command ... process_final_profile, cancel_onboarding оставлен без изменений из предыдущей версии v2.6)
+# ... (Вставь сюда полный код этих функций из предыдущего ответа v2.6) ...
+# --- Копипаста функций онбординга из v2.6 ---
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user = update.effective_user
+    # Проверка и сброс данных о еде, если наступил новый день
+    today_str = date.today().isoformat()
+    if context.user_data.get(LAST_MEAL_DATE) != today_str:
+        context.user_data[TODAY_MEALS] = []
+        context.user_data[LAST_MEAL_DATE] = today_str
+        logger.info(f"User {user.id}: Новый день, данные о приемах пищи сброшены.")
+
     if context.user_data.get(PROFILE_COMPLETE):
         await update.message.reply_text(
             f"👋 С возвращением, {user.first_name}!\nТвой профиль уже со мной. Чем могу быть полезен сегодня?\n"
             "Используй /menu для навигации или просто спроси!",
             parse_mode=ParseMode.MARKDOWN
         )
-        return ConversationHandler.END
-    if not context.user_data.get(GENDER):
-        context.user_data.clear()
+        return ConversationHandler.END # Завершаем, если профиль уже есть и это был /start
+    
+    # Если профиля нет, или это был не /start а другой вход в ConversationHandler (хотя у нас только /start)
+    # Начинаем или продолжаем онбординг.
+    if not context.user_data.get(GENDER): # Начинаем с нуля только если нет данных первого шага
+        context.user_data.clear() # Очищаем все, включая PROFILE_COMPLETE если он был False
+        # Снова устанавливаем дату, так как clear() ее удалил
+        context.user_data[LAST_MEAL_DATE] = today_str 
+        context.user_data[TODAY_MEALS] = []
         logger.info(f"User {user.id} ({user.username}) начинает создание профиля.")
     else: 
-        logger.info(f"User {user.id} ({user.username}) продолжает создание профиля или случайно ввел /start.")
+        logger.info(f"User {user.id} ({user.username}) продолжает создание профиля.")
+
     await update.message.reply_text(
         f"🌟 Привет, {user.first_name}! Я *ФитГуру* – твой личный AI-диетолог и тренер.\n\n"
         "Чтобы наши тренировки и планы питания были максимально эффективными, мне нужно немного узнать о тебе. "
@@ -153,6 +168,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         parse_mode=ParseMode.MARKDOWN
     )
     return PROFILE_GENDER
+# ... (остальные функции handle_gender_and_ask_age ... process_final_profile, cancel_onboarding как в v2.6) ...
+# Я скопирую их из предыдущей версии, чтобы файл был полным
 async def handle_gender_and_ask_age(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
@@ -213,7 +230,7 @@ async def process_final_profile(update: Update, context: ContextTypes.DEFAULT_TY
         if missing_keys:
             logger.error(f"User {user_id}: Missing keys in user_data for calculation: {missing_keys}")
             await query.edit_message_text("Ой, не хватает некоторых данных для расчета профиля. 😥 Пожалуйста, попробуй начать заново с /start.")
-            context.user_data.pop(PROFILE_COMPLETE, None)
+            context.user_data.pop(PROFILE_COMPLETE, None) # Убедимся что профиль не помечен как завершенный
             return ConversationHandler.END
         ud[BMI] = calculate_bmi(ud.get(CURRENT_WEIGHT), ud.get(HEIGHT))
         ud[BMR] = calculate_bmr(ud.get(CURRENT_WEIGHT), ud.get(HEIGHT), ud.get(AGE), ud.get(GENDER))
@@ -252,25 +269,264 @@ async def cancel_onboarding(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if not context.user_data.get(PROFILE_COMPLETE):
         logger.info(f"Пользователь {user_id} отменил создание профиля.")
         context.user_data.clear()
+        context.user_data[LAST_MEAL_DATE] = date.today().isoformat() # Восстанавливаем, если было очищено
+        context.user_data[TODAY_MEALS] = []
         await update.message.reply_text("❌ Создание профиля отменено. Можешь начать заново командой /start.")
     else: await update.message.reply_text("👍 Твой профиль уже создан. Если хочешь начать заново, используй /start (старый профиль будет сброшен).")
+    context.user_data.pop('current_meal_type', None) # Очищаем временные данные для добавления еды
+    context.user_data.pop('current_meal_description', None)
     context.user_data.pop(AWAITING_WEIGHT_UPDATE, None)
     return ConversationHandler.END
 # --- Конец копипасты функций онбординга ---
 
-# --- Обычные команды (как в v2.5) ---
-# ... (Вставь сюда полный код этих функций из предыдущего ответа v2.5) ...
+# --- Функции для ЗАПИСИ ПРИЕМОВ ПИЩИ ---
+async def add_meal_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user = update.effective_user
+    # Проверка и сброс данных о еде, если наступил новый день
+    today_str = date.today().isoformat()
+    if context.user_data.get(LAST_MEAL_DATE) != today_str:
+        context.user_data[TODAY_MEALS] = []
+        context.user_data[LAST_MEAL_DATE] = today_str
+        logger.info(f"User {user.id}: Новый день, данные о приемах пищи сброшены для /addmeal.")
+        if update.message: # Если это команда, а не callback
+            await update.message.reply_text("☀️ Новый день - новые записи о питании!")
+
+
+    if not context.user_data.get(PROFILE_COMPLETE):
+        msg = update.callback_query.message if update.callback_query else update.message
+        await msg.reply_text("Чтобы записывать приемы пищи, сначала создай профиль через /start 🌟")
+        return ConversationHandler.END
+    
+    keyboard = [
+        [InlineKeyboardButton("🍳 Завтрак", callback_data="meal_Завтрак")],
+        [InlineKeyboardButton("🥗 Обед", callback_data="meal_Обед")],
+        [InlineKeyboardButton("🍝 Ужин", callback_data="meal_Ужин")],
+        [InlineKeyboardButton("🍎 Перекус", callback_data="meal_Перекус")],
+    ]
+    msg_text = "Какой прием пищи ты хочешь записать?"
+    
+    if update.message:
+        await update.message.reply_text(msg_text, reply_markup=InlineKeyboardMarkup(keyboard))
+    elif update.callback_query: # Если вызвано из меню, например
+        await update.callback_query.message.edit_text(msg_text, reply_markup=InlineKeyboardMarkup(keyboard))
+        
+    return ADDMEAL_CHOOSE_TYPE
+
+async def add_meal_choose_type(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    
+    meal_type_name = query.data.split('_')[1] # "Завтрак", "Обед" и т.д.
+    
+    context.user_data['current_meal_type'] = meal_type_name
+    await query.edit_message_text(f"Записываем '{meal_type_name}'.\nОпиши подробно, что ты съел(а) и примерное количество (например, 'Овсянка на молоке 200г, 1 банан, кофе'):")
+    return ADDMEAL_GET_DESCRIPTION
+
+async def add_meal_get_description(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    meal_description = update.message.text
+    ud = context.user_data
+    current_meal_type = ud.get('current_meal_type', 'Прием пищи')
+
+    await update.message.reply_text(f"Понял! Анализирую калорийность для '{current_meal_type}'... 🤔 Это может занять до 30 секунд.")
+
+    profile_info = (f"Профиль пользователя: Цель калорий в день: {ud.get(TARGET_CALORIES, 'не указана')} ккал. "
+                    f"Текущий вес: {ud.get(CURRENT_WEIGHT, 'N/A')} кг. Цель: {ud.get(GOAL, 'N/A')}.")
+
+    prompt = (
+        f"{profile_info} Пользователь описывает съеденную пищу для приема '{current_meal_type}':\n"
+        f"'{meal_description}'\n\n"
+        "Твоя задача: Оцени калорийность (Ккал) и БЖУ (Белки (п), Жиры (ж), Углеводы (у) в граммах) для каждого упомянутого продукта/блюда. "
+        "Затем посчитай итоговые КБЖУ за весь этот прием пищи. "
+        "Верни ответ в следующем СТРОГОМ формате JSON (только JSON, без лишнего текста до или после, все значения КБЖУ должны быть числами):\n"
+        "{\n"
+        f"  \"meal_name\": \"{current_meal_type}\",\n" # Используем переданное имя
+        "  \"items\": [\n"
+        "    {\"name\": \"[Название продукта 1]\", \"quantity\": \"[Количество/вес продукта 1]\", \"calories\": X, \"protein\": Y, \"fat\": Z, \"carbs\": W},\n"
+        "    {\"name\": \"[Название продукта 2]\", \"quantity\": \"[Количество/вес продукта 2]\", \"calories\": X, \"protein\": Y, \"fat\": Z, \"carbs\": W}\n"
+        "  ],\n"
+        "  \"total\": {\"calories\": X_total, \"protein\": Y_total, \"fat\": Z_total, \"carbs\": W_total}\n"
+        "}\n"
+        "Если не можешь оценить какой-то продукт, укажи для него КБЖУ как 0 или не включай в items, но посчитай итог по тем, что смог. "
+        "Старайся быть максимально точным, основываясь на стандартных значениях КБЖУ."
+    )
+    
+    ai_response_json_str = await ask_groq(prompt, temperature=0.1) # Очень низкая температура для строгого JSON
+
+    try:
+        # Попытка исправить распространенные ошибки AI перед парсингом JSON
+        # Иногда AI добавляет "```json" и "```" вокруг ответа
+        if ai_response_json_str.startswith("```json"):
+            ai_response_json_str = ai_response_json_str[7:]
+        if ai_response_json_str.endswith("```"):
+            ai_response_json_str = ai_response_json_str[:-3]
+        ai_response_json_str = ai_response_json_str.strip()
+
+        meal_data = json.loads(ai_response_json_str)
+        
+        # Валидация структуры
+        if not isinstance(meal_data, dict) or \
+           'total' not in meal_data or \
+           not all(k in meal_data['total'] for k in ['calories', 'protein', 'fat', 'carbs']) or \
+           not all(isinstance(meal_data['total'][k], (int, float)) for k in ['calories', 'protein', 'fat', 'carbs']):
+            raise ValueError("Ответ AI не содержит корректные числовые поля total КБЖУ или имеет неверную структуру.")
+
+        meal_data['user_description'] = meal_description # Сохраняем оригинальное описание пользователя
+        meal_data['timestamp'] = datetime.now().isoformat() # Добавляем время записи
+
+        if TODAY_MEALS not in context.user_data or not isinstance(context.user_data[TODAY_MEALS], list):
+            context.user_data[TODAY_MEALS] = []
+        context.user_data[TODAY_MEALS].append(meal_data)
+        
+        total_cals = meal_data.get('total', {}).get('calories', 0)
+        
+        response_text = f"✅ Прием пищи '{current_meal_type}' записан!\n"
+        response_text += f"Ты съел(а): {meal_description}\n"
+        if isinstance(meal_data.get("items"), list) and meal_data["items"]:
+            response_text += "Примерная оценка по продуктам:\n"
+            for item in meal_data["items"]:
+                response_text += f"  - {item.get('name','?')} ({item.get('quantity','?')}) - {item.get('calories',0)} ккал\n"
+        response_text += f"Всего за этот прием: *{total_cals} ккал*.\n\n"
+        
+        # Удаляем временные данные после успешной обработки
+        context.user_data.pop('current_meal_type', None)
+        context.user_data.pop('current_meal_description', None)
+
+        await show_today_calories(update, context, pre_text=response_text) # Вызываем для отображения итогов
+        return ConversationHandler.END
+
+    except json.JSONDecodeError as e:
+        logger.error(f"Ошибка декодирования JSON от AI для приема пищи: {e}. Ответ AI: '{ai_response_json_str}'")
+        await update.message.reply_text("Ой, не смог разобрать ответ от AI по калориям. 🤖 Попробуй описать блюдо немного по-другому или проще. Иногда AI форматирует ответ не совсем точно.")
+    except ValueError as e:
+        logger.error(f"Ошибка в структуре данных от AI для приема пищи: {e}. Ответ AI: '{ai_response_json_str}'")
+        await update.message.reply_text("AI вернул данные в неожиданном формате. Попробуй еще раз или опиши блюдо иначе.")
+    except Exception as e:
+        logger.error(f"Непредвиденная ошибка в add_meal_get_description: {e}", exc_info=True)
+        await update.message.reply_text("Произошла внутренняя ошибка при обработке приема пищи. Попробуйте еще раз.")
+
+    # В случае любой ошибки, выходим из диалога, чтобы не зацикливаться
+    context.user_data.pop('current_meal_type', None)
+    context.user_data.pop('current_meal_description', None)
+    return ConversationHandler.END
+
+
+async def add_meal_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.message.reply_text("❌ Запись приема пищи отменена.")
+    context.user_data.pop('current_meal_type', None)
+    context.user_data.pop('current_meal_description', None)
+    return ConversationHandler.END
+
+# --- Команда /todaycalories и вспомогательная функция ---
+async def show_today_calories(update: Update, context: ContextTypes.DEFAULT_TYPE, pre_text=""):
+    user = update.effective_user
+    # Проверка и сброс данных о еде, если наступил новый день
+    today_str = date.today().isoformat()
+    if context.user_data.get(LAST_MEAL_DATE) != today_str:
+        context.user_data[TODAY_MEALS] = []
+        context.user_data[LAST_MEAL_DATE] = today_str
+        logger.info(f"User {user.id}: Новый день, данные о приемах пищи сброшены для /todaycalories.")
+        # Не отправляем сообщение здесь, если это вызвано из другого обработчика
+
+    if not context.user_data.get(PROFILE_COMPLETE):
+        msg_target = update.message if update.message else update.callback_query.message
+        await msg_target.reply_text("Сначала создай профиль через /start, чтобы я мог отслеживать твои калории. 🌟")
+        return
+
+    today_meals_data = context.user_data.get(TODAY_MEALS, [])
+    
+    total_calories_today = 0
+    total_protein_today = 0
+    total_fat_today = 0
+    total_carbs_today = 0
+    summary_meals_text = ""
+
+    if not today_meals_data:
+        summary_meals_text = " 기록된 식사가 없습니다. /addmeal 명령을 사용하여 식사를 추가하세요.\n" # Корейский для теста локализации, потом заменить
+    else:
+        summary_meals_text = "*За сегодня ты съел(а):*\n"
+        for meal_entry in today_meals_data:
+            meal_name = meal_entry.get('meal_name', 'Прием пищи')
+            # meal_desc = meal_entry.get('user_description', 'Без описания') # Оригинальное описание пользователя
+            
+            items_text_list = []
+            if isinstance(meal_entry.get("items"), list):
+                for item in meal_entry["items"]:
+                    items_text_list.append(f"  - {item.get('name','?')} ({item.get('quantity','?')}) ≈ {item.get('calories',0)} ккал")
+            
+            total_meal_cals = meal_entry.get('total', {}).get('calories', 0)
+            total_meal_p = meal_entry.get('total', {}).get('protein', 0)
+            total_meal_f = meal_entry.get('total', {}).get('fat', 0)
+            total_meal_c = meal_entry.get('total', {}).get('carbs', 0)
+
+            summary_meals_text += f"\n🍽️ *{meal_name}* (Общ: {total_meal_cals} ккал, Б:{total_meal_p} Ж:{total_meal_f} У:{total_meal_c}):\n"
+            if items_text_list:
+                summary_meals_text += "\n".join(items_text_list) + "\n"
+            else: # Если нет breakdown по items, покажем user_description
+                summary_meals_text += f"  _{meal_entry.get('user_description', 'Детали не распознаны')}_\n"
+
+            total_calories_today += total_meal_cals
+            total_protein_today += total_meal_p
+            total_fat_today += total_meal_f
+            total_carbs_today += total_meal_c
+        
+        summary_meals_text += f"\n*📊 Итого за сегодня:*\n"
+        summary_meals_text += f"  Ккал: *{total_calories_today}*,\n"
+        summary_meals_text += f"  Белки: {total_protein_today:.1f} г,\n" # Округление до 1 знака
+        summary_meals_text += f"  Жиры: {total_fat_today:.1f} г,\n"
+        summary_meals_text += f"  Углеводы: {total_carbs_today:.1f} г\n"
+
+    target_cals = context.user_data.get(TARGET_CALORIES)
+    remaining_cals_text = ""
+    if target_cals is not None and isinstance(target_cals, (int, float)):
+        remaining = target_cals - total_calories_today
+        if remaining >= 0:
+            remaining_cals_text = f"\n🎯 Твоя цель на день: *{target_cals} ккал*.\n✨ Осталось потребить: *{remaining:.0f} ккал*."
+        else:
+            remaining_cals_text = f"\n🎯 Твоя цель на день: *{target_cals} ккал*.\n🔴 Перебор: *{abs(remaining):.0f} ккал*!"
+    
+    full_response = pre_text + summary_meals_text + remaining_cals_text
+    
+    message_target = update.message if update.message else update.callback_query.message
+    await message_target.reply_text(full_response, parse_mode=ParseMode.MARKDOWN)
+
+async def today_calories_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await show_today_calories(update, context)
+
+
+# --- Обычные команды (menu_command, help_command, my_profile_command, weight_command_entry, train_command_entry, handle_train_location_and_generate - как в v2.6) ---
+# ... (Вставь сюда полный код этих функций из предыдущего ответа v2.6) ...
 # --- Копипаста обычных команд ---
-async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE): # Как в v2.6
     if not context.user_data.get(PROFILE_COMPLETE):
         await update.message.reply_text("Сначала давай создадим твой профиль! Нажми /start 😊", parse_mode=ParseMode.MARKDOWN)
         return
-    menu_buttons = [[KeyboardButton("🏋️‍♂️ Тренировка (/train)"), KeyboardButton("⚖️ Обновить вес (/weight)")], [KeyboardButton("📊 Мой профиль (/myprofile)"), KeyboardButton("❓ Помощь (/help)")],]
-    await update.message.reply_text("👇 Вот что мы можем сделать:", reply_markup=ReplyKeyboardMarkup(menu_buttons, resize_keyboard=True, one_time_keyboard=False))
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    help_text = ("👋 Привет! Я *ФитГуру* – твой гид в мире фитнеса и здорового питания.\n\n📌 *Основные команды:*\n/start - Начать работу, создать или просмотреть профиль.\n/menu - Показать главное меню с кнопками.\n/myprofile - Твой текущий фитнес-профиль и показатели.\n/train - Предложить варианты тренировок.\n/weight - Обновить свой текущий вес.\n/cancel - (Во время создания профиля) Отменить процесс.\n/help - Это сообщение.\n\n🤖 Я могу помочь с тренировками и расчетом показателей. Для более сложных вопросов пока не обучен.")
+    menu_buttons = [
+        [KeyboardButton("✍️ Записать еду (/addmeal)"), KeyboardButton("🗓️ Мои калории (/todaycalories)")], # ИЗМЕНЕНО
+        [KeyboardButton("🏋️‍♂️ Тренировка (/train)"), KeyboardButton("⚖️ Обновить вес (/weight)")],
+        [KeyboardButton("📊 Мой профиль (/myprofile)"), KeyboardButton("❓ Помощь (/help)")],
+    ]
+    await update.message.reply_text(
+        "👇 Вот что мы можем сделать:",
+        reply_markup=ReplyKeyboardMarkup(menu_buttons, resize_keyboard=True, one_time_keyboard=False)
+    )
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE): # Как в v2.6, но с новыми командами
+    help_text = (
+        "👋 Привет! Я *ФитГуру* – твой гид в мире фитнеса и здорового питания.\n\n"
+        "📌 *Основные команды:*\n"
+        "/start - Начать работу, создать или просмотреть профиль.\n"
+        "/menu - Показать главное меню с кнопками.\n"
+        "/myprofile - Твой текущий фитнес-профиль и показатели.\n"
+        "/train - Предложить варианты тренировок.\n"
+        "/weight - Обновить свой текущий вес.\n"
+        "/addmeal - Записать прием пищи.\n"
+        "/todaycalories - Посмотреть итоги по КБЖУ за сегодня.\n"
+        "/cancel - (Во время диалога) Отменить текущее действие.\n"
+        "/help - Это сообщение.\n\n"
+        "🤖 Я могу помочь с тренировками, расчетом показателей и записью питания!"
+    )
     await update.message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN)
-async def my_profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def my_profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE): # Как в v2.6
+    # ... (код my_profile_command из v2.6) ...
     if not context.user_data.get(PROFILE_COMPLETE):
         await update.message.reply_text("Твой профиль еще не создан. Пожалуйста, начни с /start 🌟")
         return
@@ -285,13 +541,15 @@ async def my_profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         elif weekly_weight_change_kg > 0.05: weight_change_prediction_text = f"📈 Прогноз: *{weekly_weight_change_kg:.1f} кг/нед.* в плюс\n"
     summary = (f"👤 *Твой фитнес-профиль, {update.effective_user.first_name}:*\n\n  - Пол: _{ud.get(GENDER, 'N/A').capitalize()}_\n  - Возраст: _{ud.get(AGE, 'N/A')} лет_\n  - Рост: _{ud.get(HEIGHT, 'N/A')} см_\n  - Вес: *{ud.get(CURRENT_WEIGHT, 'N/A')} кг*\n  - Активность: _{ud.get(ACTIVITY_LEVEL, 'N/A').capitalize()}_\n  - Цель: _{ud.get(GOAL, 'N/A').capitalize()}_\n\n📊 *Расчетные показатели:*\n  - ИМТ: *{ud.get(BMI, 'N/A')}*{bmi_interp}\n  - BMR: *{ud.get(BMR, 'N/A')} ккал/день*\n  - TDEE: *{ud.get(TDEE, 'N/A')} ккал/день*\n  - Рекомендуемые калории: `{ud.get(TARGET_CALORIES, 'N/A')}` *ккал/день*\n{weight_change_prediction_text}\nДля обновления веса используй /weight. Чтобы начать профиль заново, нажми /start (старый будет удален).")
     await update.message.reply_text(summary, parse_mode=ParseMode.MARKDOWN)
-async def weight_command_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def weight_command_entry(update: Update, context: ContextTypes.DEFAULT_TYPE): # Как в v2.6
+    # ... (код weight_command_entry из v2.6) ...
     if not context.user_data.get(PROFILE_COMPLETE):
         await update.message.reply_text("Сначала давай создадим твой профиль! Нажми /start 😊")
         return
     await update.message.reply_text("⚖️ Введи свой *текущий вес* (например, 70.5):", parse_mode=ParseMode.MARKDOWN)
     context.user_data[AWAITING_WEIGHT_UPDATE] = True
-async def handle_weight_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_weight_update(update: Update, context: ContextTypes.DEFAULT_TYPE): # Как в v2.6
+    # ... (код handle_weight_update из v2.6) ...
     try:
         new_weight = float(update.message.text.replace(',', '.'))
         if not 30 <= new_weight <= 300: raise ValueError("Некорректный вес")
@@ -322,11 +580,8 @@ async def handle_weight_update(update: Update, context: ContextTypes.DEFAULT_TYP
         logger.error(f"Ошибка в handle_weight_update: {e}", exc_info=True)
         await update.message.reply_text("💥 Ой, произошла ошибка при обновлении веса.")
         context.user_data.pop(AWAITING_WEIGHT_UPDATE, None)
-# --- Конец копипасты обычных команд ---
-
-# --- Улучшенная команда /train (как в v2.5) ---
-async def train_command_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ... (код train_command_entry как в v2.5) ...
+async def train_command_entry(update: Update, context: ContextTypes.DEFAULT_TYPE): # Как в v2.6
+    # ... (код train_command_entry из v2.6) ...
     if not context.user_data.get(PROFILE_COMPLETE):
         await update.message.reply_text("Чтобы подобрать тренировку, мне нужен твой профиль. Начни с /start 🌟", parse_mode=ParseMode.MARKDOWN)
         return
@@ -334,10 +589,8 @@ async def train_command_entry(update: Update, context: ContextTypes.DEFAULT_TYPE
     reply_markup = InlineKeyboardMarkup(keyboard)
     message_to_reply = update.message if update.message else update.callback_query.message
     await message_to_reply.reply_text("Отлично! Где ты планируешь заниматься?", reply_markup=reply_markup)
-
-
-async def handle_train_location_and_generate(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ... (код handle_train_location_and_generate как в v2.5, с логами и проверкой ответа AI) ...
+async def handle_train_location_and_generate(update: Update, context: ContextTypes.DEFAULT_TYPE): # Как в v2.6
+    # ... (код handle_train_location_and_generate из v2.6) ...
     query = update.callback_query
     await query.answer()
     user_id = update.effective_user.id 
@@ -376,18 +629,42 @@ async def handle_train_location_and_generate(update: Update, context: ContextTyp
     else:
         logger.warning(f"User {user_id}: AI вернул сообщение, похожее на ошибку, или пустой ответ: {reply}")
         await query.message.reply_text(reply if reply else "Не удалось сгенерировать тренировку. Попробуйте позже.", parse_mode=ParseMode.MARKDOWN)
+# --- Конец копипасты обычных команд ---
 
 
-# --- Обработчик общих сообщений (как в v2.5) ---
+# --- Обработчик общих сообщений (как в v2.6) ---
 async def general_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_message = update.message.text
-    if user_message == "🏋️‍♂️ Тренировка (/train)": await train_command_entry(update, context); return
-    if user_message == "⚖️ Обновить вес (/weight)": await weight_command_entry(update, context); return
-    if user_message == "📊 Мой профиль (/myprofile)": await my_profile_command(update, context); return
-    if user_message == "❓ Помощь (/help)": await help_command(update, context); return
-    if context.user_data.get(AWAITING_WEIGHT_UPDATE) is True: await handle_weight_update(update, context); return
+    # Сначала проверяем, не является ли сообщение текстом с кнопки меню
+    if user_message == "✍️ Записать еду (/addmeal)": # ИЗМЕНЕНО для новой кнопки
+        await add_meal_start(update, context)
+        return
+    if user_message == "🗓️ Мои калории (/todaycalories)": # ИЗМЕНЕНО для новой кнопки
+        await today_calories_command(update, context)
+        return
+    if user_message == "🏋️‍♂️ Тренировка (/train)":
+        await train_command_entry(update, context)
+        return
+    if user_message == "⚖️ Обновить вес (/weight)":
+        await weight_command_entry(update, context)
+        return
+    if user_message == "📊 Мой профиль (/myprofile)":
+        await my_profile_command(update, context)
+        return
+    if user_message == "❓ Помощь (/help)":
+        await help_command(update, context)
+        return
+        
+    if context.user_data.get(AWAITING_WEIGHT_UPDATE) is True:
+        await handle_weight_update(update, context)
+        return
+
     logger.info(f"Получено обычное текстовое сообщение от {update.effective_user.id} ({update.effective_user.username}): '{user_message}'. AI не будет вызван.")
-    await update.message.reply_text("🤖 Хм, я не совсем понял твой запрос. Если нужна помощь, используй /help или кнопки в /menu. Я могу помочь с тренировками и расчетом показателей! 😊", parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text(
+        "🤖 Хм, я не совсем понял твой запрос. Если нужна помощь, используй /help или кнопки в /menu. "
+        "Я могу помочь с тренировками, расчетом показателей и записью твоего питания! 😊",
+        parse_mode=ParseMode.MARKDOWN
+    )
 
 # --- Основная функция ---
 def main():
@@ -397,7 +674,8 @@ def main():
 
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
-    onboarding_conv_handler = ConversationHandler( # Как в v2.5
+    # ConversationHandler для создания профиля
+    onboarding_conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start_command)],
         states={
             PROFILE_GENDER: [CallbackQueryHandler(handle_gender_and_ask_age, pattern="^(мужской|женский)$")],
@@ -407,20 +685,37 @@ def main():
             PROFILE_ACTIVITY: [CallbackQueryHandler(handle_activity_and_ask_goal, pattern="^(минимальная|легкая|средняя|высокая|экстремальная)$")],
             PROFILE_GOAL: [CallbackQueryHandler(process_final_profile, pattern="^(похудеть|поддерживать вес|набрать массу)$")],
         },
-        fallbacks=[CommandHandler("cancel", cancel_onboarding), CommandHandler("start", start_command)],
+        fallbacks=[CommandHandler("cancel", cancel_onboarding), CommandHandler("start", start_command)], # /start также может быть fallback
         allow_reentry=True, per_user=True, per_chat=True,
     )
     app.add_handler(onboarding_conv_handler)
 
+    # ConversationHandler для добавления приема пищи
+    add_meal_conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("addmeal", add_meal_start)],
+        states={
+            ADDMEAL_CHOOSE_TYPE: [CallbackQueryHandler(add_meal_choose_type, pattern="^meal_(Завтрак|Обед|Ужин|Перекус)$")], # Паттерн использует русские названия
+            ADDMEAL_GET_DESCRIPTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_meal_get_description)],
+        },
+        fallbacks=[CommandHandler("cancel", add_meal_cancel)],
+        per_user=True, per_chat=True,
+    )
+    app.add_handler(add_meal_conv_handler)
+
+
+    # Обычные команды
     app.add_handler(CommandHandler("train", train_command_entry))
     app.add_handler(CallbackQueryHandler(handle_train_location_and_generate, pattern="^train_(home|gym|street)$"))
     app.add_handler(CommandHandler("menu", menu_command))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("myprofile", my_profile_command))
     app.add_handler(CommandHandler("weight", weight_command_entry))
+    app.add_handler(CommandHandler("todaycalories", today_calories_command))
+    
+    # Обработчик текстовых сообщений (должен быть одним из последних)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, general_message_handler))
 
-    logger.info("🤖 Бот ФитГуру v2.6 (Gemma, таймаут 30s, улучшенные промпты) запускается...")
+    logger.info("🤖 Бот ФитГуру v2.7 (с записью приемов пищи) запускается...")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
